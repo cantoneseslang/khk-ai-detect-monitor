@@ -18,23 +18,47 @@ last_update = 0
 current_channels = []
 data_lock = threading.Lock()
 
-ALLOWED_ORIGINS = ['kirii-portfolio-1.vercel.app', 'kirii-portfolio-1-kirii.vercel.app']
+import json as _json
+PORTFOLIO_HOST = 'kirii-portfolio-1.vercel.app'
+LOGIN_URL = 'https://kirii-portfolio-1.vercel.app/'
+_used_nonces = set()
+
+def _verify_portal_token(token_str):
+    """Verify portal_access JWT: check exp and nonce reuse."""
+    try:
+        payload_b64 = token_str.split('.')[0]
+        payload_b64 += '=' * (-len(payload_b64) % 4)
+        payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get('exp', 0)
+        nonce = payload.get('nonce', '')
+        if time.time() > exp:
+            return False
+        if nonce in _used_nonces:
+            return False
+        _used_nonces.add(nonce)
+        if len(_used_nonces) > 1000:
+            _used_nonces.clear()
+        return True
+    except:
+        return False
 
 def require_view_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Already has session cookie -> allow
+        # Session cookie from valid portal access -> allow
         if request.cookies.get('vpass') == '1':
             return f(*args, **kwargs)
-        # Has portal_access param from portfolio -> allow and set cookie
-        if request.args.get('portal_access'):
+        # portal_access token + must come from portfolio referer
+        token = request.args.get('portal_access')
+        ref = request.referrer or ''
+        if token and PORTFOLIO_HOST in ref and _verify_portal_token(token):
             resp = f(*args, **kwargs)
             if not isinstance(resp, Response):
                 resp = Response(resp)
             resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
             return resp
-        # Redirect to portfolio login
-        return Response('', status=302, headers={'Location': 'https://kirii-portfolio-1.vercel.app/'})
+        # Everything else -> redirect to portfolio login
+        return Response('', status=302, headers={'Location': LOGIN_URL})
     return decorated
 
 @app.route('/')
