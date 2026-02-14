@@ -5,9 +5,12 @@ import base64
 import threading
 import time
 
+from functools import wraps
+
 app = Flask(__name__)
 
 SEND_TOKEN = os.environ.get('SEND_TOKEN', 'khk-send-2026')
+VIEW_TOKEN = os.environ.get('VIEW_TOKEN', 'khk-view-2026')
 
 # Multi-channel image storage
 channel_frames = {}  # {channel_number: base64_data}
@@ -15,7 +18,20 @@ last_update = 0
 current_channels = []
 data_lock = threading.Lock()
 
+def require_view_token(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        t = request.args.get('token') or request.cookies.get('vtoken')
+        if t == VIEW_TOKEN:
+            resp = f(*args, **kwargs)
+            if isinstance(resp, Response):
+                resp.set_cookie('vtoken', VIEW_TOKEN, max_age=86400*30, samesite='None', secure=True)
+            return resp
+        return Response('Unauthorized', status=401)
+    return decorated
+
 @app.route('/')
+@require_view_token
 def index():
     return render_template_string('''<!DOCTYPE html>
 <html lang="ja">
@@ -146,6 +162,7 @@ def receive_image():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/frames')
+@require_view_token
 def api_frames():
     with data_lock:
         return jsonify({
@@ -155,6 +172,7 @@ def api_frames():
         })
 
 @app.route('/vercel/frame')
+@require_view_token
 def get_frame():
     with data_lock:
         if not channel_frames:
