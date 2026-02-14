@@ -26,23 +26,14 @@ def require_view_auth(f):
         # Already has session cookie -> allow
         if request.cookies.get('vpass') == '1':
             return f(*args, **kwargs)
-        # Came from portfolio (Referer check) -> set cookie and allow
-        ref = request.referrer or ''
-        for origin in ALLOWED_ORIGINS:
-            if origin in ref:
-                resp = f(*args, **kwargs)
-                if isinstance(resp, Response):
-                    resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
-                else:
-                    resp = Response(resp)
-                    resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
-                return resp
-        # Token in URL -> set cookie and allow
-        if request.args.get('token') == VIEW_TOKEN:
+        # Has portal_access param from portfolio -> allow and set cookie
+        if request.args.get('portal_access'):
             resp = f(*args, **kwargs)
-            if isinstance(resp, Response):
-                resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
+            if not isinstance(resp, Response):
+                resp = Response(resp)
+            resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
             return resp
+        # Block everything else
         return Response('Unauthorized', status=401)
     return decorated
 
