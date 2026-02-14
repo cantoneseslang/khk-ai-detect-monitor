@@ -18,20 +18,36 @@ last_update = 0
 current_channels = []
 data_lock = threading.Lock()
 
-def require_view_token(f):
+ALLOWED_ORIGINS = ['kirii-portfolio-1.vercel.app', 'kirii-portfolio-1-kirii.vercel.app']
+
+def require_view_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        t = request.args.get('token') or request.cookies.get('vtoken')
-        if t == VIEW_TOKEN:
+        # Already has session cookie -> allow
+        if request.cookies.get('vpass') == '1':
+            return f(*args, **kwargs)
+        # Came from portfolio (Referer check) -> set cookie and allow
+        ref = request.referrer or ''
+        for origin in ALLOWED_ORIGINS:
+            if origin in ref:
+                resp = f(*args, **kwargs)
+                if isinstance(resp, Response):
+                    resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
+                else:
+                    resp = Response(resp)
+                    resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
+                return resp
+        # Token in URL -> set cookie and allow
+        if request.args.get('token') == VIEW_TOKEN:
             resp = f(*args, **kwargs)
             if isinstance(resp, Response):
-                resp.set_cookie('vtoken', VIEW_TOKEN, max_age=86400*30, samesite='None', secure=True)
+                resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
             return resp
         return Response('Unauthorized', status=401)
     return decorated
 
 @app.route('/')
-@require_view_token
+@require_view_auth
 def index():
     return render_template_string('''<!DOCTYPE html>
 <html lang="ja">
@@ -162,7 +178,7 @@ def receive_image():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/frames')
-@require_view_token
+@require_view_auth
 def api_frames():
     with data_lock:
         return jsonify({
@@ -172,7 +188,7 @@ def api_frames():
         })
 
 @app.route('/vercel/frame')
-@require_view_token
+@require_view_auth
 def get_frame():
     with data_lock:
         if not channel_frames:
