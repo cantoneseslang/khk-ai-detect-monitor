@@ -1,146 +1,180 @@
-from flask import Flask, request, Response, jsonify
-import requests
+from flask import Flask, render_template_string, jsonify, request, Response
 import os
 from datetime import datetime
 import base64
 import threading
 import time
-from flask import stream_with_context
 
 app = Flask(__name__)
 
-# ローカル監視システムのIPアドレス
-LOCAL_MONITOR_URL = "http://192.168.0.119:5013"
+SEND_TOKEN = os.environ.get('SEND_TOKEN', 'khk-send-2026')
 
-# 受信した画像の保存
-received_image = None
-received_image_timestamp = None
-image_lock = threading.Lock()
+# Multi-channel image storage
+channel_frames = {}  # {channel_number: base64_data}
+last_update = 0
+current_channels = []
+data_lock = threading.Lock()
 
 @app.route('/')
 def index():
-    """メインページ - 監視システムの状態表示"""
-    return jsonify({
-        "status": "online",
-        "service": "KHK AI Monitor - Vercel Production",
-        "local_system": LOCAL_MONITOR_URL,
-        "timestamp": datetime.now().isoformat(),
-        "note": "画像は /vercel/stream エンドポイントで取得してください",
-        "endpoints": {
-            "stream": "/vercel/stream",
-            "frame": "/vercel/frame",
-            "receive": "/receive_image"
+    return render_template_string('''<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KHK AI-DETECT MONITOR</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#fff;font-family:Arial,sans-serif}
+.wrap{max-width:1400px;margin:0 auto;padding:8px}
+.top{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.title{font-size:13px;color:#888}
+.mode-btns button{background:#333;color:#ccc;border:1px solid #555;padding:4px 14px;cursor:pointer;font-size:12px;border-radius:3px;margin-left:4px}
+.mode-btns button.active{background:#1a6;color:#fff;border-color:#1a6}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(2,1fr);gap:3px;height:calc(100vh - 50px)}
+.cell{background:#000;position:relative;overflow:hidden;border-radius:3px}
+.cell img{width:100%;height:100%;object-fit:cover;display:block}
+.cell .ch{position:absolute;bottom:4px;left:6px;font-size:11px;color:#aaa;text-shadow:0 0 3px #000}
+.cell .nosig{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#444;font-size:14px}
+.status{position:fixed;bottom:4px;right:8px;font-size:11px;color:#555}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="top">
+        <span class="title">KHK AI-DETECT MONITOR</span>
+        <div class="mode-btns">
+            <button id="btnA" class="active" onclick="setMode('A')">Group A</button>
+            <button id="btnB" onclick="setMode('B')">Group B</button>
+        </div>
+    </div>
+    <div class="grid" id="grid"></div>
+</div>
+<div class="status" id="st">Loading...</div>
+<script>
+var mode='A';
+var groupA=[2,3,4,7,11,14];
+var groupB=[1,5,10,13,14,15];
+var grid=document.getElementById('grid');
+var st=document.getElementById('st');
+
+function setMode(m){
+    mode=m;
+    document.getElementById('btnA').className=m==='A'?'active':'';
+    document.getElementById('btnB').className=m==='B'?'active':'';
+}
+
+function buildGrid(channels){
+    grid.innerHTML='';
+    for(var i=0;i<6;i++){
+        var ch=channels[i];
+        var cell=document.createElement('div');
+        cell.className='cell';
+        cell.id='cell'+ch;
+        cell.innerHTML='<div class="nosig" id="ns'+ch+'">CH'+ch+'</div><img id="img'+ch+'" style="display:none"><div class="ch">CH'+ch+'</div>';
+        grid.appendChild(cell);
+    }
+}
+
+function refresh(){
+    var t=new Date();
+    fetch('/api/frames?t='+t.getTime())
+    .then(function(r){return r.json();})
+    .then(function(data){
+        if(!data.frames){st.textContent='No data - '+t.toLocaleTimeString();return;}
+        var channels=mode==='A'?groupA:groupB;
+        buildGrid(channels);
+        var count=0;
+        for(var i=0;i<channels.length;i++){
+            var ch=String(channels[i]);
+            var f=data.frames[ch];
+            if(f){
+                var img=document.getElementById('img'+ch);
+                var ns=document.getElementById('ns'+ch);
+                if(img){img.src='data:image/jpeg;base64,'+f;img.style.display='block';}
+                if(ns)ns.style.display='none';
+                count++;
+            }
         }
+        st.textContent='Live '+count+'/6 - '+t.toLocaleTimeString();
     })
+    .catch(function(){
+        st.textContent='Connection error - '+t.toLocaleTimeString();
+    });
+}
+
+buildGrid(groupA);
+setInterval(refresh,2000);
+refresh();
+</script>
+</body>
+</html>''')
+
+@app.route('/receive_multi', methods=['POST'])
+def receive_multi():
+    global channel_frames, last_update, current_channels
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'no data'}), 400
+        t = data.get('token')
+        if t != SEND_TOKEN:
+            return jsonify({'error': 'unauthorized'}), 401
+        frames = data.get('frames', {})
+        channels = data.get('channels', [])
+        with data_lock:
+            for ch, frame in frames.items():
+                channel_frames[str(ch)] = frame
+            current_channels = channels
+            last_update = data.get('timestamp', time.time())
+        return jsonify({'status': 'ok', 'received': len(frames)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/receive_image', methods=['POST'])
 def receive_image():
-    """ローカル監視システムから画像を受信"""
-    global received_image, received_image_timestamp
-    
+    """Single image receive - backward compatibility"""
     try:
         data = request.get_json()
-        if not data or 'image' not in data:
-            return jsonify({"error": "画像データがありません"}), 400
-        
-        # base64デコードして画像データを保存
-        image_data = base64.b64decode(data['image'])
-        timestamp = data.get('timestamp', time.time())
-        
-        with image_lock:
-            received_image = image_data
-            received_image_timestamp = timestamp
-        
-        print(f"✅ 画像受信成功: {len(image_data)} bytes, timestamp: {timestamp}")
-        return jsonify({"success": True, "received_bytes": len(image_data)})
-        
+        if not data:
+            return jsonify({'error': 'no data'}), 400
+        t = data.get('token')
+        if t != SEND_TOKEN:
+            return jsonify({'error': 'unauthorized'}), 401
+        return jsonify({'status': 'ok'})
     except Exception as e:
-        print(f"❌ 画像受信エラー: {str(e)}")
-        return jsonify({"error": f"受信エラー: {str(e)}"}), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/vercel/stream')
-def vercel_stream():
-    """Vercelでの画像ストリーミング（受信した画像を配信）"""
-    try:
-        def generate_vercel_stream():
-            while True:
-                with image_lock:
-                    if received_image:
-                        # 受信した画像をストリーミング
-                        yield f"--boundary\r\n"
-                        yield f"Content-Type: image/jpeg\r\n"
-                        yield f"Content-Length: {len(received_image)}\r\n\r\n"
-                        yield received_image
-                        yield "\r\n"
-                
-                # 0.5秒間隔
-                time.sleep(0.5)
-        
-        return Response(
-            stream_with_context(generate_vercel_stream()),
-            content_type='multipart/x-mixed-replace; boundary=boundary',
-            headers={
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
-                'Access-Control-Allow-Origin': '*'
-            }
-        )
-    except Exception as e:
-        return jsonify({"error": f"ストリーミングエラー: {str(e)}"}), 500
+@app.route('/api/frames')
+def api_frames():
+    with data_lock:
+        return jsonify({
+            'frames': dict(channel_frames),
+            'channels': current_channels,
+            'last_update': last_update
+        })
 
 @app.route('/vercel/frame')
-def vercel_single_frame():
-    """Vercelでの単発画像取得（受信した画像を返す）"""
-    try:
-        with image_lock:
-            if received_image:
-                return Response(
-                    received_image,
-                    content_type='image/jpeg',
-                    headers={
-                        'Cache-Control': 'no-cache, no-store, must-revalidate',
-                        'Access-Control-Allow-Origin': '*'
-                    }
-                )
-        
-        return jsonify({"error": "画像が受信されていません"}), 404
-    except Exception as e:
-        return jsonify({"error": f"エラー: {str(e)}"}), 500
+def get_frame():
+    with data_lock:
+        if not channel_frames:
+            return Response('no image', status=404)
+        first_key = next(iter(channel_frames))
+        try:
+            image_data = base64.b64decode(channel_frames[first_key])
+            return Response(image_data, content_type='image/jpeg',
+                           headers={'Cache-Control': 'no-cache'})
+        except:
+            return Response('decode error', status=500)
 
 @app.route('/status')
-def status():
-    """ローカル監視システムの状態確認"""
-    try:
-        response = requests.get(f"{LOCAL_MONITOR_URL}/", timeout=5)
-        return jsonify({
-            "local_system_status": "online" if response.status_code == 200 else "offline",
-            "local_url": LOCAL_MONITOR_URL,
-            "vercel_status": "online",
-            "vercel_endpoints": ["/vercel/stream", "/vercel/frame", "/receive_image"],
-            "received_image": received_image is not None,
-            "last_image_timestamp": received_image_timestamp,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({
-            "local_system_status": "connection_error",
-            "error": str(e),
-            "vercel_status": "online",
-            "vercel_endpoints": ["/vercel/stream", "/vercel/frame", "/receive_image"],
-            "received_image": received_image is not None,
-            "last_image_timestamp": received_image_timestamp,
-            "timestamp": datetime.now().isoformat()
-        })
-
-@app.route('/health')
-def health():
-    """ヘルスチェック"""
+def get_status():
     return jsonify({
-        "status": "healthy",
-        "service": "KHK AI Monitor - Vercel Production",
-        "vercel_endpoints": ["/vercel/stream", "/vercel/frame", "/receive_image"],
-        "received_image": received_image is not None,
-        "timestamp": datetime.now().isoformat()
+        'has_frames': len(channel_frames) > 0,
+        'channels': list(channel_frames.keys()),
+        'last_update': last_update,
+        'timestamp': datetime.now().isoformat()
     })
 
 if __name__ == '__main__':
-    app.run(debug=False)
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
