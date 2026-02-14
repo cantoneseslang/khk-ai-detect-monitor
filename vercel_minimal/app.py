@@ -33,8 +33,8 @@ def require_view_auth(f):
                 resp = Response(resp)
             resp.set_cookie('vpass', '1', max_age=86400, samesite='None', secure=True)
             return resp
-        # Block everything else
-        return Response('Unauthorized', status=401)
+        # Redirect to portfolio login
+        return Response('', status=302, headers={'Location': 'https://kirii-portfolio-1.vercel.app/'})
     return decorated
 
 @app.route('/')
